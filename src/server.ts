@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
-import { fingerprint } from './fingerprint';
+import { fingerprint, AudioDecodeError } from './fingerprint';
 import crypto from 'node:crypto';
 
 // Wave E2 — Chromaprint fingerprinting worker.
@@ -77,6 +77,15 @@ app.post('/fingerprint', async (req, reply) => {
       byteLength: buffer.length,
     };
   } catch (err) {
+    // Caller-fault decode errors (corrupt / unsupported audio) → 422
+    // so upstream knows it's not a transient worker failure to retry.
+    if (err instanceof AudioDecodeError) {
+      req.log.warn({ stderr: err.stderr }, 'audio decode failed');
+      return reply.code(422).send({
+        error: 'audio_decode_failed',
+        message: 'Could not decode audio file',
+      });
+    }
     req.log.error({ err }, 'fingerprint failed');
     return reply.code(500).send({
       error: 'fingerprint_failed',
