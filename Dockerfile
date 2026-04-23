@@ -10,10 +10,16 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm ci --omit=dev
+# Install ALL deps (including dev) so we can compile TS in-container.
+COPY package*.json tsconfig.json ./
+RUN npm ci
 
-COPY dist ./dist
+# Build TypeScript → dist/
+COPY src ./src
+RUN npm run build
+
+# Strip dev deps after build to slim the final image.
+RUN npm prune --omit=dev
 
 ENV NODE_ENV=production
 ENV PORT=8080
