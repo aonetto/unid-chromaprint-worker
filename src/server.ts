@@ -80,10 +80,22 @@ app.post('/fingerprint', async (req, reply) => {
     // Caller-fault decode errors (corrupt / unsupported audio) → 422
     // so upstream knows it's not a transient worker failure to retry.
     if (err instanceof AudioDecodeError) {
-      req.log.warn({ stderr: err.stderr }, 'audio decode failed');
+      req.log.warn({
+        reason: err.reason,
+        stderr: err.stderr,
+        inputBytes: err.inputBytes,
+        inputDurationSeconds: err.inputDurationSeconds,
+        wavBytes: err.wavBytes,
+        wavDurationSeconds: err.wavDurationSeconds,
+      }, 'audio decode failed');
       return reply.code(422).send({
         error: 'audio_decode_failed',
-        message: 'Could not decode audio file',
+        reason: err.reason,
+        message: err.message,
+        inputBytes: err.inputBytes,
+        inputDurationSeconds: err.inputDurationSeconds,
+        wavBytes: err.wavBytes,
+        wavDurationSeconds: err.wavDurationSeconds,
       });
     }
     req.log.error({ err }, 'fingerprint failed');
