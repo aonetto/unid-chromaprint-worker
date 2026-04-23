@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
-import { fingerprint, AudioDecodeError } from './fingerprint';
+import { fingerprint, fingerprintChunked, AudioDecodeError } from './fingerprint';
 import crypto from 'node:crypto';
 
 // Wave E2 — Chromaprint fingerprinting worker.
@@ -77,34 +77,58 @@ app.post('/fingerprint', async (req, reply) => {
       byteLength: buffer.length,
     };
   } catch (err) {
-    // Caller-fault decode errors (corrupt / unsupported audio) → 422
-    // so upstream knows it's not a transient worker failure to retry.
-    if (err instanceof AudioDecodeError) {
-      req.log.warn({
-        reason: err.reason,
-        stderr: err.stderr,
-        inputBytes: err.inputBytes,
-        inputDurationSeconds: err.inputDurationSeconds,
-        wavBytes: err.wavBytes,
-        wavDurationSeconds: err.wavDurationSeconds,
-      }, 'audio decode failed');
-      return reply.code(422).send({
-        error: 'audio_decode_failed',
-        reason: err.reason,
-        message: err.message,
-        inputBytes: err.inputBytes,
-        inputDurationSeconds: err.inputDurationSeconds,
-        wavBytes: err.wavBytes,
-        wavDurationSeconds: err.wavDurationSeconds,
-      });
-    }
-    req.log.error({ err }, 'fingerprint failed');
-    return reply.code(500).send({
-      error: 'fingerprint_failed',
-      message: err instanceof Error ? err.message : 'unknown',
-    });
+    return handleFingerprintError(err, req, reply);
   }
 });
+
+// E2.7 — chunked fingerprinting. For artist-upload seeding: generate
+// an array of 30-second window fingerprints stepping by 15s across
+// the full track. Each chunk is a standalone 30s fingerprint, so
+// identify queries (also 30s-normalized) can compare directly via
+// same-length XOR without subsequence sliding.
+app.post('/fingerprint-chunked', async (req, reply) => {
+  const file = await req.file();
+  if (!file) return reply.code(400).send({ error: 'no_file' });
+
+  const buffer = await file.toBuffer();
+  if (buffer.length === 0) return reply.code(400).send({ error: 'empty_file' });
+
+  try {
+    const result = await fingerprintChunked(buffer);
+    return {
+      chunks: result.chunks,
+      totalDuration: result.totalDuration,
+      byteLength: buffer.length,
+    };
+  } catch (err) {
+    return handleFingerprintError(err, req, reply);
+  }
+});
+
+// Shared error handler so /fingerprint and /fingerprint-chunked
+// surface the same structured 422 response on decode errors.
+function handleFingerprintError(err: unknown, req: any, reply: any) {
+  if (err instanceof AudioDecodeError) {
+    req.log.warn({
+      reason: err.reason,
+      stderr: err.stderr,
+      inputBytes: err.inputBytes,
+      inputDurationSeconds: err.inputDurationSeconds,
+    }, 'audio decode failed');
+    return reply.code(422).send({
+      error: 'audio_decode_failed',
+      reason: err.reason,
+      message: err.message,
+      inputBytes: err.inputBytes,
+      inputDurationSeconds: err.inputDurationSeconds,
+    });
+  }
+  req.log.error({ err }, 'fingerprint failed');
+  return reply.code(500).send({
+    error: 'fingerprint_failed',
+    message: err instanceof Error ? err.message : 'unknown',
+  });
+}
 
 const port = parseInt(process.env.PORT ?? '8080', 10);
 const host = '0.0.0.0';
