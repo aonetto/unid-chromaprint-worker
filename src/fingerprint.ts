@@ -71,7 +71,7 @@ const STEP_SECONDS = 15; // 50% overlap between adjacent windows
  *   - fingerprintChunked(audio) → array of 30s FPs at offsets
  *     [0, 15, 30, ...] (for artist-upload seeding)
  *
- * Both use the same piped ffmpeg → fpcalc -raw approach that bypasses
+ * Both use the same piped ffmpeg → fpcalc -format s16le approach that bypasses
  * fpcalc's buggy WAV decoder.
  */
 export async function fingerprint(audio: Buffer): Promise<FingerprintResult> {
@@ -170,7 +170,7 @@ function logInputMagic(audio: Buffer, reqId: string) {
 }
 
 /**
- * Pipe ffmpeg → fpcalc -raw stdin. All fingerprinting goes through
+ * Pipe ffmpeg → fpcalc stdin. All fingerprinting goes through
  * this path — it bypasses fpcalc's WAV decoder (broken on short files
  * in 1.5.1) by reading raw interleaved PCM samples from stdin.
  *
@@ -222,7 +222,7 @@ function runPipedFingerprint(
     // at the declared sample rate + channel count. This bypasses
     // fpcalc's WAV/AAC/etc. demuxers entirely.
     const fpcalcArgs = [
-      '-raw',
+      '-format', 's16le',
       '-rate', '44100',
       '-channels', '1',
       '-length', String(WINDOW_SECONDS),
