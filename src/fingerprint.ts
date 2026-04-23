@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, stat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -18,51 +18,41 @@ export class AudioDecodeError extends Error {
 /**
  * Fingerprint audio using Chromaprint (fpcalc).
  *
- * Two-stage pipeline (E2.3 fix):
- *   1. ffmpeg transcode → 16-bit mono PCM WAV @ 44.1kHz. Strips any
- *      container/codec quirks (trimmed M4A from QuickTime, AAC variants
- *      with missing headers, browser-recorded webm/opus, etc.) and
- *      gives fpcalc a guaranteed-clean input. Previously fpcalc was
- *      called directly on user audio and failed with "Error decoding
- *      audio frame (End of file)" on a long tail of formats.
- *   2. fpcalc → fingerprint of the transcoded WAV.
+ * Two-stage pipeline:
+ *   1. ffmpeg transcode → 16-bit mono PCM WAV @ 44.1kHz
+ *   2. fpcalc → fingerprint of the transcoded WAV
  *
- * Both temp files live only for the duration of the call. UNID's R2
- * audio is already deleted within 60s of upload — this worker
- * preserves that posture by never persisting audio beyond a single
- * request lifecycle.
+ * E2.4 — verbose diagnostic logging at every stage so Railway logs
+ * surface exactly what bytes flow through and what each tool emits.
+ * Logs:
+ *   - input buffer size + first 16 bytes (magic bytes)
+ *   - ffmpeg full stdout + stderr (not just on error)
+ *   - transcoded WAV file size + first 44 bytes (RIFF header)
+ *   - fpcalc command + stdout + stderr
  */
 export async function fingerprint(audio: Buffer): Promise<FingerprintResult> {
   const dir = await mkdtemp(join(tmpdir(), 'unid-fp-'));
   const inputPath = join(dir, 'input');
   const wavPath = join(dir, 'normalized.wav');
 
+  // ── Diagnostic: input buffer ──────────────────────────────────────
+  const inputMagic = audio.subarray(0, 16);
+  console.log(`[fingerprint] input buffer: ${audio.length} bytes`);
+  console.log(`[fingerprint] input magic (hex): ${inputMagic.toString('hex')}`);
+  console.log(`[fingerprint] input magic (ascii): ${inputMagic.toString('utf8').replace(/[^\x20-\x7e]/g, '.')}`);
+
   try {
     await writeFile(inputPath, audio);
     await transcodeToWav(inputPath, wavPath);
     return await runFpcalc(wavPath);
   } finally {
-    await rm(dir, { recursive: true, force: true }).catch(() => {
-      // Cleanup failure is non-fatal: audio was already fingerprinted,
-      // and the OS will eventually reap /tmp. Don't block the response.
-    });
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
-/**
- * Transcode arbitrary input audio to 16-bit mono PCM WAV @ 44.1 kHz.
- *
- *   -ac 1            → mono (fingerprinting is mono; saves CPU)
- *   -ar 44100        → 44.1 kHz sample rate (chromaprint reference rate)
- *   -sample_fmt s16  → 16-bit PCM (decoder-friendly, no float quirks)
- *   -f wav -y        → force WAV container, overwrite if exists
- *
- * On failure throws AudioDecodeError with the ffmpeg stderr captured
- * (Railway logs it; the worker surfaces a friendlier message upstream).
- */
 function transcodeToWav(inputPath: string, outputPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const proc = spawn('ffmpeg', [
+    const args = [
       '-i', inputPath,
       '-ac', '1',
       '-ar', '44100',
@@ -70,35 +60,65 @@ function transcodeToWav(inputPath: string, outputPath: string): Promise<void> {
       '-f', 'wav',
       '-y',
       outputPath,
-    ]);
+    ];
+    console.log(`[fingerprint] ffmpeg ${args.join(' ')}`);
 
+    const proc = spawn('ffmpeg', args);
+    let stdout = '';
     let stderr = '';
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
 
     let killed = false;
     const timer = setTimeout(() => {
       killed = true;
       proc.kill('SIGKILL');
-      reject(new AudioDecodeError('ffmpeg transcode timeout after 30s', stderr.slice(-800)));
+      reject(new AudioDecodeError('ffmpeg transcode timeout after 30s', stderr.slice(-1500)));
     }, 30_000);
 
     proc.on('error', (err) => {
       clearTimeout(timer);
-      reject(new AudioDecodeError(`ffmpeg spawn failed: ${err.message}`, stderr.slice(-800)));
+      reject(new AudioDecodeError(`ffmpeg spawn failed: ${err.message}`, stderr.slice(-1500)));
     });
 
-    proc.on('close', (code) => {
+    proc.on('close', async (code) => {
       clearTimeout(timer);
       if (killed) return;
+
+      // Always log full ffmpeg output (not only on error) — diagnoses
+      // silent-success cases where ffmpeg writes a 0-byte WAV.
+      console.log(`[fingerprint] ffmpeg exited ${code}`);
+      if (stdout) console.log(`[fingerprint] ffmpeg stdout:\n${stdout}`);
+      if (stderr) console.log(`[fingerprint] ffmpeg stderr:\n${stderr}`);
+
       if (code !== 0) {
-        // Log full stderr to Railway logs for debugging future formats.
-        console.error(`[fingerprint] ffmpeg exited ${code}\nstderr:\n${stderr}`);
         reject(new AudioDecodeError(
           `Could not decode audio file (ffmpeg exited ${code})`,
-          stderr.slice(-800),
+          stderr.slice(-1500),
         ));
         return;
       }
+
+      // Inspect the transcoded WAV.
+      try {
+        const st = await stat(outputPath);
+        console.log(`[fingerprint] transcoded WAV: ${st.size} bytes`);
+        if (st.size === 0) {
+          reject(new AudioDecodeError('ffmpeg produced empty WAV', stderr.slice(-1500)));
+          return;
+        }
+        const head = await readFile(outputPath);
+        const header44 = head.subarray(0, Math.min(44, head.length));
+        console.log(`[fingerprint] WAV header (hex): ${header44.toString('hex')}`);
+        console.log(`[fingerprint] WAV header (ascii): ${header44.toString('utf8').replace(/[^\x20-\x7e]/g, '.')}`);
+        // Sanity check: should start with "RIFF" and contain "WAVEfmt "
+        if (!header44.subarray(0, 4).equals(Buffer.from('RIFF'))) {
+          console.warn(`[fingerprint] WARNING: transcoded file does NOT start with RIFF`);
+        }
+      } catch (err) {
+        console.error(`[fingerprint] failed to inspect transcoded WAV:`, err);
+      }
+
       resolve();
     });
   });
@@ -106,15 +126,12 @@ function transcodeToWav(inputPath: string, outputPath: string): Promise<void> {
 
 function runFpcalc(audioPath: string): Promise<FingerprintResult> {
   return new Promise((resolve, reject) => {
-    const proc = spawn('fpcalc', [
-      '-json',
-      '-length', '120', // sample first 120s of audio
-      audioPath,
-    ]);
+    const args = ['-json', '-length', '120', audioPath];
+    console.log(`[fingerprint] fpcalc ${args.join(' ')}`);
 
+    const proc = spawn('fpcalc', args);
     let stdout = '';
     let stderr = '';
-
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
 
@@ -133,11 +150,15 @@ function runFpcalc(audioPath: string): Promise<FingerprintResult> {
     proc.on('close', (code) => {
       clearTimeout(timer);
       if (killed) return;
+
+      console.log(`[fingerprint] fpcalc exited ${code}`);
+      if (stderr) console.log(`[fingerprint] fpcalc stderr:\n${stderr}`);
+      if (stdout) {
+        // Truncate stdout in logs — fingerprint base64 is huge.
+        console.log(`[fingerprint] fpcalc stdout (head): ${stdout.slice(0, 200)}`);
+      }
+
       if (code !== 0) {
-        // After the ffmpeg transcode the input is normalized PCM WAV,
-        // so fpcalc should never fail at the decoder layer. If it
-        // does, log full stderr — it's a real fpcalc bug worth seeing.
-        console.error(`[fingerprint] fpcalc exited ${code} on transcoded WAV\nstderr:\n${stderr}`);
         reject(new Error(`fpcalc exited ${code}: ${stderr.trim().slice(0, 200)}`));
         return;
       }
@@ -147,6 +168,7 @@ function runFpcalc(audioPath: string): Promise<FingerprintResult> {
           reject(new Error(`fpcalc returned invalid JSON: ${stdout.slice(0, 200)}`));
           return;
         }
+        console.log(`[fingerprint] success — duration=${parsed.duration}s, fp_length=${parsed.fingerprint.length}`);
         resolve({
           fingerprint: parsed.fingerprint,
           duration: parsed.duration,
