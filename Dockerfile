@@ -19,14 +19,19 @@ RUN apt-get update && \
       ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Build Chromaprint from source.
+# Build Chromaprint from master (ffmpeg 5.x API compatibility).
+# v1.5.1 tag predates the ffmpeg 5.x migration (removed
+# avcodec_decode_audio4, AVStream::codec, channel_layout, const
+# correctness on AVInputFormat, etc.) — only master compiles clean
+# against Debian bookworm's ffmpeg 5.1.x.
 # BUILD_TOOLS=ON compiles fpcalc linked against system FFmpeg libs.
+# BUILD_TESTS=OFF skips googletest fetch/compile (~30s saved).
 # FFT_LIB=avfft uses FFmpeg's FFT (avoids FFTW3 dep).
-RUN git clone --depth 1 --branch v1.5.1 \
-      https://github.com/acoustid/chromaprint.git /tmp/chromaprint && \
+RUN git clone --depth 1 https://github.com/acoustid/chromaprint.git /tmp/chromaprint && \
     cd /tmp/chromaprint && \
     cmake -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_TOOLS=ON \
+          -DBUILD_TESTS=OFF \
           -DFFT_LIB=avfft \
           . && \
     make -j$(nproc) && \
