@@ -39,9 +39,13 @@ RUN git clone --depth 1 https://github.com/acoustid/chromaprint.git /tmp/chromap
     ldconfig && \
     rm -rf /tmp/chromaprint
 
-# Verify fpcalc is installed and works.
+# Verify fpcalc is installed + dump help so build logs show exactly
+# which flags this build supports (-raw vs -format s16le varies
+# between Chromaprint versions).
 RUN fpcalc -version && \
-    echo "fpcalc installed successfully"
+    echo "--- fpcalc -h ---" && \
+    (fpcalc -h 2>&1 | head -40 || true) && \
+    echo "--- end fpcalc -h ---"
 
 WORKDIR /app
 
