@@ -45,35 +45,37 @@ export class AudioDecodeError extends Error {
 }
 
 const MIN_AUDIO_SECONDS = 3; // fpcalc needs at least 3 seconds of audio
-const MIN_WAV_BYTES = 10_000; // 10 KB sanity floor for transcoded WAV
-const FALLBACK_DURATION_RATIO = 0.8; // retry if primary loses >20% of audio
+const MIN_WAV_BYTES = 10_000; // 10 KB sanity floor for transcoded WAV (fallback path)
+const FALLBACK_DURATION_RATIO = 0.8; // retry if primary WAV loses >20% of audio
 
 /**
  * Fingerprint audio using Chromaprint (fpcalc).
  *
- * Defensive pipeline (E2.5 — real-world clip support):
- *   1. ffprobe input duration (informational; for fallback ratio check)
- *   2. ffmpeg primary transcode (aggressive error tolerance, video stripped)
- *   3. ffprobe transcoded WAV duration
- *   4. If WAV duration < 80% of input duration → fallback transcode
- *      (aresample=async=1 fills broken-timestamp gaps with silence)
- *   5. Validate WAV: size ≥ 10 KB, header starts "RIFF....WAVE"
- *   6. Reject if WAV duration < 3 seconds (fpcalc min)
- *   7. Run fpcalc on the validated WAV
+ * Two-path strategy (E2.6 — fpcalc 1.5.1 can't decode short WAV files):
  *
- * Every stage logs with a request ID prefix `[fp:<id>]` so Railway
- * logs can be filtered to a single invocation.
+ * PATH 1 — piped (preferred): ffmpeg decodes input to raw 16-bit mono
+ *   PCM and pipes directly to fpcalc's stdin in raw mode. fpcalc's
+ *   WAV decoder is bypassed entirely, so the "Error decoding audio
+ *   frame (End of file)" bug on short WAV inputs doesn't apply.
+ *   Works on any input ffmpeg can read, including TikTok MP4,
+ *   QuickTime-trimmed M4A, browser webm/opus, etc.
  *
- * AudioDecodeError encodes the failure mode (audio_too_short,
- * transcoded_too_small, invalid_wav_header, ffmpeg_error, ffprobe_error)
- * + measured byte/duration counts so the HTTP response itself tells
- * the caller why decoding failed.
+ * PATH 2 — WAV file (fallback): ffmpeg transcodes input to a
+ *   normalized PCM WAV on disk, runs fpcalc on the file. Kept as a
+ *   fallback in case the piped approach fails for an unexpected
+ *   reason (EPIPE on ffmpeg, fpcalc -raw mode issue, etc.). Retains
+ *   all the previous validation (WAV header check, min duration,
+ *   fallback transcode with aresample).
+ *
+ * Both paths share:
+ *   - reqId-prefixed logs (`[fp:<id>]`) for per-invocation filtering
+ *   - AudioDecodeError with structured reason + measured counts for
+ *     the HTTP 422 response body
  */
 export async function fingerprint(audio: Buffer): Promise<FingerprintResult> {
   const reqId = randomUUID().slice(0, 8);
   const dir = await mkdtemp(join(tmpdir(), `unid-fp-${reqId}-`));
   const inputPath = join(dir, 'input');
-  const wavPath = join(dir, 'normalized.wav');
 
   // ── Diagnostic: input ────────────────────────────────────────────
   const inputMagic = audio.subarray(0, 16);
@@ -84,77 +86,221 @@ export async function fingerprint(audio: Buffer): Promise<FingerprintResult> {
   try {
     await writeFile(inputPath, audio);
 
-    // Probe input duration (best-effort; ffprobe may fail on weird formats
-    // but ffmpeg can still transcode them, so don't abort here).
-    let inputDuration = NaN;
+    // ── PATH 1: piped (ffmpeg → raw PCM → fpcalc stdin) ─────────
+    const pipedStart = Date.now();
     try {
-      inputDuration = await runFfprobe(inputPath, reqId);
-      console.log(`[fp:${reqId}] input duration (ffprobe): ${inputDuration.toFixed(2)}s`);
+      const result = await fingerprintPiped(inputPath, reqId);
+      console.log(`[fp:${reqId}] method: piped — success in ${Date.now() - pipedStart}ms`);
+      return result;
     } catch (err) {
-      console.warn(`[fp:${reqId}] ffprobe input failed (continuing):`, err instanceof Error ? err.message : err);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[fp:${reqId}] method: piped — failed in ${Date.now() - pipedStart}ms: ${msg}`);
+      // Fall through to WAV-file fallback
     }
 
-    // ── Attempt 1: primary transcode ──────────────────────────────
-    await runFfmpegPrimary(inputPath, wavPath, reqId);
-    let wavStats = await stat(wavPath);
-    let wavDuration = await runFfprobe(wavPath, reqId).catch(() => NaN);
-    console.log(`[fp:${reqId}] WAV attempt 1: ${wavStats.size} bytes, ${isFinite(wavDuration) ? wavDuration.toFixed(2) + 's' : 'unknown duration'}`);
-
-    // ── Attempt 2: fallback if too much audio was lost ────────────
-    const lostTooMuch = isFinite(inputDuration) && isFinite(wavDuration)
-      && inputDuration > 0
-      && wavDuration / inputDuration < FALLBACK_DURATION_RATIO;
-
-    if (lostTooMuch) {
-      console.warn(
-        `[fp:${reqId}] primary lost ${((1 - wavDuration / inputDuration) * 100).toFixed(1)}% of audio ` +
-        `(${wavDuration.toFixed(1)}s / ${inputDuration.toFixed(1)}s). Trying fallback.`,
-      );
-      await unlink(wavPath).catch(() => {});
-      await runFfmpegFallback(inputPath, wavPath, reqId);
-      wavStats = await stat(wavPath);
-      wavDuration = await runFfprobe(wavPath, reqId).catch(() => NaN);
-      console.log(`[fp:${reqId}] WAV attempt 2: ${wavStats.size} bytes, ${isFinite(wavDuration) ? wavDuration.toFixed(2) + 's' : 'unknown duration'}`);
+    // ── PATH 2: WAV file fallback ────────────────────────────────
+    const fallbackStart = Date.now();
+    try {
+      const result = await fingerprintWavFile(inputPath, audio, dir, reqId);
+      console.log(`[fp:${reqId}] method: fallback_wav — success in ${Date.now() - fallbackStart}ms`);
+      return result;
+    } catch (err) {
+      console.warn(`[fp:${reqId}] method: fallback_wav — failed in ${Date.now() - fallbackStart}ms`);
+      throw err; // AudioDecodeError or generic 500
     }
-
-    // ── Validation ────────────────────────────────────────────────
-    if (wavStats.size < MIN_WAV_BYTES) {
-      throw new AudioDecodeError('transcoded_too_small',
-        `Transcoded WAV is only ${wavStats.size} bytes (need ${MIN_WAV_BYTES} minimum). Input audio may be corrupted or truncated.`,
-        { inputBytes: audio.length, inputDurationSeconds: inputDuration, wavBytes: wavStats.size, wavDurationSeconds: wavDuration });
-    }
-
-    await assertValidWavHeader(wavPath, reqId, {
-      inputBytes: audio.length,
-      inputDurationSeconds: inputDuration,
-      wavBytes: wavStats.size,
-      wavDurationSeconds: wavDuration,
-    });
-
-    if (!isFinite(wavDuration) || wavDuration < MIN_AUDIO_SECONDS) {
-      throw new AudioDecodeError('audio_too_short',
-        `Audio is ${isFinite(wavDuration) ? wavDuration.toFixed(1) + 's' : 'unknown duration'}. Need at least ${MIN_AUDIO_SECONDS} seconds to fingerprint.`,
-        { inputBytes: audio.length, inputDurationSeconds: inputDuration, wavBytes: wavStats.size, wavDurationSeconds: wavDuration });
-    }
-
-    // ── Fingerprint ───────────────────────────────────────────────
-    return await runFpcalc(wavPath, reqId);
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
-// ─── ffmpeg primary: aggressive error tolerance ─────────────────────────────
+// ─── PATH 1: piped — ffmpeg raw PCM → fpcalc stdin ──────────────────────────
 //
-//   -hide_banner -loglevel warning  → quieter output
-//   -i <input>                     → source file
-//   -vn                            → strip video (TikTok / IG clips have video+audio)
-//   -map 0:a:0?                    → grab first audio track; `?` makes optional
-//                                     (some files have multiple audio streams)
-//   -ac 1 -ar 44100 -sample_fmt s16 → mono PCM @ 44.1 kHz, 16-bit
-//   -fflags +discardcorrupt+genpts  → skip corrupt packets, regen timestamps
-//   -err_detect ignore_err          → continue past decode errors
-//   -f wav -y                       → WAV container, overwrite
+// Command equivalent (conceptually):
+//   ffmpeg -i <input> -ac 1 -ar 44100 -f s16le pipe:1 \
+//     | fpcalc -raw -rate 44100 -channels 1 -length 120 -json -
+//
+// fpcalc's `-raw` flag skips its WAV decoder entirely — it reads raw
+// interleaved PCM samples from the given file (`-` = stdin) at the
+// declared sample rate + channel count. This is the workaround for
+// the fpcalc 1.5.1 "End of file" bug on short WAV inputs.
+async function fingerprintPiped(inputPath: string, reqId: string): Promise<FingerprintResult> {
+  return new Promise((resolve, reject) => {
+    const ffmpegArgs = [
+      '-hide_banner', '-loglevel', 'warning',
+      '-i', inputPath,
+      '-vn', '-map', '0:a:0?',
+      '-ac', '1', '-ar', '44100', '-sample_fmt', 's16',
+      '-fflags', '+discardcorrupt+genpts',
+      '-err_detect', 'ignore_err',
+      '-f', 's16le',
+      'pipe:1',
+    ];
+    const fpcalcArgs = [
+      '-raw',
+      '-rate', '44100',
+      '-channels', '1',
+      '-length', '120',
+      '-json',
+      '-',
+    ];
+    console.log(`[fp:${reqId}] piped ffmpeg: ${ffmpegArgs.join(' ')}`);
+    console.log(`[fp:${reqId}] piped fpcalc: ${fpcalcArgs.join(' ')}`);
+
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+    const fpcalc = spawn('fpcalc', fpcalcArgs);
+
+    let ffmpegStderr = '';
+    let fpcalcStdout = '';
+    let fpcalcStderr = '';
+    let ffmpegExit: number | null = null;
+    let fpcalcExit: number | null = null;
+    let settled = false;
+    let bytesPiped = 0;
+
+    ffmpeg.stderr.on('data', (d) => { ffmpegStderr += d.toString(); });
+    fpcalc.stdout.on('data', (d) => { fpcalcStdout += d.toString(); });
+    fpcalc.stderr.on('data', (d) => { fpcalcStderr += d.toString(); });
+
+    // Count bytes flowing through the pipe (diagnostic).
+    ffmpeg.stdout.on('data', (chunk: Buffer) => { bytesPiped += chunk.length; });
+
+    // Pipe ffmpeg stdout → fpcalc stdin.
+    ffmpeg.stdout.pipe(fpcalc.stdin);
+
+    // Handle EPIPE gracefully: if fpcalc closes stdin before ffmpeg
+    // finishes (e.g. fpcalc reached -length cap), the pipe errors.
+    // This isn't a failure — fpcalc got enough audio.
+    ffmpeg.stdout.on('error', (err) => {
+      const msg = (err as NodeJS.ErrnoException).code || err.message;
+      if (msg === 'EPIPE') {
+        console.log(`[fp:${reqId}] piped: ffmpeg EPIPE (fpcalc closed stdin early — expected when input > 120s)`);
+      } else {
+        console.warn(`[fp:${reqId}] piped: ffmpeg stdout error: ${msg}`);
+      }
+    });
+    fpcalc.stdin.on('error', (err) => {
+      const msg = (err as NodeJS.ErrnoException).code || err.message;
+      if (msg === 'EPIPE') {
+        console.log(`[fp:${reqId}] piped: fpcalc stdin EPIPE (ok if -length cap reached)`);
+      } else {
+        console.warn(`[fp:${reqId}] piped: fpcalc stdin error: ${msg}`);
+      }
+    });
+
+    const settle = (err: Error | null, result?: FingerprintResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ffmpeg.kill(); } catch {}
+      try { fpcalc.kill(); } catch {}
+      if (err) reject(err);
+      else if (result) resolve(result);
+    };
+
+    ffmpeg.on('error', (err) => settle(new Error(`piped ffmpeg spawn: ${err.message}`)));
+    fpcalc.on('error', (err) => settle(new Error(`piped fpcalc spawn: ${err.message}`)));
+
+    ffmpeg.on('close', (code) => {
+      ffmpegExit = code;
+      console.log(`[fp:${reqId}] piped ffmpeg exit: ${code}, piped ${bytesPiped} bytes of PCM`);
+      if (ffmpegStderr) console.log(`[fp:${reqId}] piped ffmpeg stderr:\n${ffmpegStderr}`);
+    });
+
+    fpcalc.on('close', (code) => {
+      fpcalcExit = code;
+      console.log(`[fp:${reqId}] piped fpcalc exit: ${code}`);
+      if (fpcalcStderr) console.log(`[fp:${reqId}] piped fpcalc stderr:\n${fpcalcStderr}`);
+
+      if (code !== 0) {
+        settle(new Error(`piped fpcalc exited ${code}: ${fpcalcStderr.trim().slice(0, 200)}`));
+        return;
+      }
+      try {
+        const parsed = JSON.parse(fpcalcStdout);
+        if (!parsed.fingerprint || typeof parsed.duration !== 'number') {
+          settle(new Error(`piped fpcalc returned invalid JSON: ${fpcalcStdout.slice(0, 200)}`));
+          return;
+        }
+        console.log(`[fp:${reqId}] piped success — duration=${parsed.duration}s, fp_length=${parsed.fingerprint.length}`);
+        settle(null, { fingerprint: parsed.fingerprint, duration: parsed.duration });
+      } catch (err) {
+        settle(new Error(`piped fpcalc JSON parse failed: ${err instanceof Error ? err.message : 'unknown'}`));
+      }
+    });
+
+    const timer = setTimeout(() => {
+      console.warn(`[fp:${reqId}] piped timeout — ffmpeg exit=${ffmpegExit}, fpcalc exit=${fpcalcExit}, piped=${bytesPiped}B`);
+      settle(new Error('piped fingerprint timeout after 60s'));
+    }, 60_000);
+  });
+}
+
+// ─── PATH 2: WAV file fallback ──────────────────────────────────────────────
+//
+// Retains the previous defensive pipeline: ffprobe input duration,
+// ffmpeg transcode with -bitexact + -map_metadata -1 (strips LIST
+// chunks), ffprobe WAV duration, fallback aresample transcode if
+// primary lost too much audio, WAV header + size + duration
+// validation, then fpcalc on the file.
+async function fingerprintWavFile(
+  inputPath: string,
+  audio: Buffer,
+  dir: string,
+  reqId: string,
+): Promise<FingerprintResult> {
+  const wavPath = join(dir, 'normalized.wav');
+
+  let inputDuration = NaN;
+  try {
+    inputDuration = await runFfprobe(inputPath, reqId);
+    console.log(`[fp:${reqId}] input duration (ffprobe): ${inputDuration.toFixed(2)}s`);
+  } catch (err) {
+    console.warn(`[fp:${reqId}] ffprobe input failed (continuing):`, err instanceof Error ? err.message : err);
+  }
+
+  await runFfmpegPrimary(inputPath, wavPath, reqId);
+  let wavStats = await stat(wavPath);
+  let wavDuration = await runFfprobe(wavPath, reqId).catch(() => NaN);
+  console.log(`[fp:${reqId}] WAV attempt 1: ${wavStats.size} bytes, ${isFinite(wavDuration) ? wavDuration.toFixed(2) + 's' : 'unknown duration'}`);
+
+  const lostTooMuch = isFinite(inputDuration) && isFinite(wavDuration)
+    && inputDuration > 0
+    && wavDuration / inputDuration < FALLBACK_DURATION_RATIO;
+
+  if (lostTooMuch) {
+    console.warn(
+      `[fp:${reqId}] primary lost ${((1 - wavDuration / inputDuration) * 100).toFixed(1)}% of audio. Trying fallback.`,
+    );
+    await unlink(wavPath).catch(() => {});
+    await runFfmpegFallback(inputPath, wavPath, reqId);
+    wavStats = await stat(wavPath);
+    wavDuration = await runFfprobe(wavPath, reqId).catch(() => NaN);
+    console.log(`[fp:${reqId}] WAV attempt 2: ${wavStats.size} bytes, ${isFinite(wavDuration) ? wavDuration.toFixed(2) + 's' : 'unknown duration'}`);
+  }
+
+  if (wavStats.size < MIN_WAV_BYTES) {
+    throw new AudioDecodeError('transcoded_too_small',
+      `Transcoded WAV is only ${wavStats.size} bytes (need ${MIN_WAV_BYTES} minimum).`,
+      { inputBytes: audio.length, inputDurationSeconds: inputDuration, wavBytes: wavStats.size, wavDurationSeconds: wavDuration });
+  }
+
+  await assertValidWavHeader(wavPath, reqId, {
+    inputBytes: audio.length,
+    inputDurationSeconds: inputDuration,
+    wavBytes: wavStats.size,
+    wavDurationSeconds: wavDuration,
+  });
+
+  if (!isFinite(wavDuration) || wavDuration < MIN_AUDIO_SECONDS) {
+    throw new AudioDecodeError('audio_too_short',
+      `Audio is ${isFinite(wavDuration) ? wavDuration.toFixed(1) + 's' : 'unknown duration'}. Need at least ${MIN_AUDIO_SECONDS} seconds to fingerprint.`,
+      { inputBytes: audio.length, inputDurationSeconds: inputDuration, wavBytes: wavStats.size, wavDurationSeconds: wavDuration });
+  }
+
+  return await runFpcalc(wavPath, reqId);
+}
+
+// ─── ffmpeg primary (file output) ──────────────────────────────────────────
 function runFfmpegPrimary(inputPath: string, outputPath: string, reqId: string): Promise<void> {
   const args = [
     '-hide_banner', '-loglevel', 'warning',
@@ -163,12 +309,6 @@ function runFfmpegPrimary(inputPath: string, outputPath: string, reqId: string):
     '-ac', '1', '-ar', '44100', '-sample_fmt', 's16',
     '-fflags', '+discardcorrupt+genpts',
     '-err_detect', 'ignore_err',
-    // -bitexact + -map_metadata -1 → minimal WAV: RIFF → fmt → data only.
-    // Without these, ffmpeg inserts a LIST (INFO) metadata chunk between
-    // fmt and data that fpcalc 1.5.1 (Debian bookworm) mishandles on
-    // short files (<120s), failing with "Error decoding audio frame
-    // (End of file)". Same WAV structure worked on the full 466s HURU
-    // track but broke on a 27s QuickTime trim — that's the tell.
     '-bitexact',
     '-map_metadata', '-1',
     '-f', 'wav', '-y',
@@ -177,11 +317,6 @@ function runFfmpegPrimary(inputPath: string, outputPath: string, reqId: string):
   return runFfmpeg(args, reqId, 'primary');
 }
 
-// ─── ffmpeg fallback: aresample=async=1 fills missing-packet gaps ───────────
-//
-// aresample's async mode handles broken timestamps and missing packets by
-// inserting silence at the correct offset, instead of truncating output
-// at the first gap.
 function runFfmpegFallback(inputPath: string, outputPath: string, reqId: string): Promise<void> {
   const args = [
     '-hide_banner', '-loglevel', 'warning',
@@ -189,7 +324,6 @@ function runFfmpegFallback(inputPath: string, outputPath: string, reqId: string)
     '-ac', '1', '-ar', '44100', '-sample_fmt', 's16',
     '-acodec', 'pcm_s16le',
     '-af', 'aresample=async=1:first_pts=0',
-    // Same LIST-chunk strip as primary — required for fpcalc 1.5.1.
     '-bitexact',
     '-map_metadata', '-1',
     '-f', 'wav', '-y',
@@ -237,7 +371,6 @@ function runFfmpeg(args: string[], reqId: string, label: string): Promise<void> 
   });
 }
 
-// ─── ffprobe: returns duration in seconds (NaN on probe failure) ────────────
 function runFfprobe(filePath: string, reqId: string): Promise<number> {
   return new Promise((resolve, reject) => {
     const proc = spawn('ffprobe', [
@@ -282,7 +415,6 @@ function runFfprobe(filePath: string, reqId: string): Promise<number> {
   });
 }
 
-// ─── WAV header validator ────────────────────────────────────────────────────
 async function assertValidWavHeader(
   wavPath: string,
   reqId: string,
@@ -298,7 +430,6 @@ async function assertValidWavHeader(
   console.log(`[fp:${reqId}] WAV header (hex): ${header.toString('hex')}`);
   console.log(`[fp:${reqId}] WAV header (ascii): ${header.toString('utf8').replace(/[^\x20-\x7e]/g, '.')}`);
 
-  // RIFF....WAVE — bytes 0-3 must be "RIFF", bytes 8-11 must be "WAVE"
   if (header.length < 12) {
     throw new AudioDecodeError('invalid_wav_header',
       `Transcoded file is too small to be a valid WAV (${header.length} bytes)`,
@@ -313,7 +444,6 @@ async function assertValidWavHeader(
   }
 }
 
-// ─── fpcalc ──────────────────────────────────────────────────────────────────
 function runFpcalc(audioPath: string, reqId: string): Promise<FingerprintResult> {
   return new Promise((resolve, reject) => {
     const args = ['-json', '-length', '120', audioPath];
@@ -343,9 +473,6 @@ function runFpcalc(audioPath: string, reqId: string): Promise<FingerprintResult>
       console.log(`[fp:${reqId}] fpcalc exit: ${code}`);
       if (stderr) console.log(`[fp:${reqId}] fpcalc stderr:\n${stderr}`);
       if (code !== 0) {
-        // After WAV validation + duration check, fpcalc should never
-        // fail at the decoder layer. If it does, surface as a regular
-        // 500 (not AudioDecodeError) — this is a real worker bug.
         reject(new Error(`fpcalc exited ${code}: ${stderr.trim().slice(0, 200)}`));
         return;
       }
