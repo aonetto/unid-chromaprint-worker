@@ -1,0 +1,25 @@
+{
+  "name": "unid-chromaprint-worker",
+  "version": "1.0.0",
+  "description": "Audio fingerprinting worker for UNID. Wraps fpcalc behind an authed HTTP endpoint.",
+  "main": "dist/server.js",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "fastify": "^4.26.0",
+    "@fastify/multipart": "^8.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.0"
+  }
+}
