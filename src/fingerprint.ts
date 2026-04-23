@@ -217,8 +217,12 @@ function runPipedFingerprint(
 
     ffmpegArgs.push('-f', 's16le', 'pipe:1');
 
+    // fpcalc reads raw s16le PCM from stdin (`-`). `-format s16le`
+    // tells it the input is signed 16-bit little-endian PCM samples
+    // at the declared sample rate + channel count. This bypasses
+    // fpcalc's WAV/AAC/etc. demuxers entirely.
     const fpcalcArgs = [
-      '-raw',
+      '-format', 's16le',
       '-rate', '44100',
       '-channels', '1',
       '-length', String(WINDOW_SECONDS),
