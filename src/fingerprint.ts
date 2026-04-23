@@ -222,7 +222,7 @@ function runPipedFingerprint(
     // at the declared sample rate + channel count. This bypasses
     // fpcalc's WAV/AAC/etc. demuxers entirely.
     const fpcalcArgs = [
-      '-format', 's16le',
+      '-raw',
       '-rate', '44100',
       '-channels', '1',
       '-length', String(WINDOW_SECONDS),
