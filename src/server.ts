@@ -23,12 +23,12 @@ if (!WORKER_SECRET) {
 
 const app = Fastify({
   logger: true,
-  bodyLimit: 50 * 1024 * 1024, // 50MB max audio
+  bodyLimit: 200 * 1024 * 1024, // 200MB max audio (long-form DJ sets, full albums)
 });
 
 app.register(multipart, {
   limits: {
-    fileSize: 50 * 1024 * 1024,
+    fileSize: 200 * 1024 * 1024,
     files: 1,
   },
 });
