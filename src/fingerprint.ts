@@ -163,6 +163,14 @@ function runFfmpegPrimary(inputPath: string, outputPath: string, reqId: string):
     '-ac', '1', '-ar', '44100', '-sample_fmt', 's16',
     '-fflags', '+discardcorrupt+genpts',
     '-err_detect', 'ignore_err',
+    // -bitexact + -map_metadata -1 → minimal WAV: RIFF → fmt → data only.
+    // Without these, ffmpeg inserts a LIST (INFO) metadata chunk between
+    // fmt and data that fpcalc 1.5.1 (Debian bookworm) mishandles on
+    // short files (<120s), failing with "Error decoding audio frame
+    // (End of file)". Same WAV structure worked on the full 466s HURU
+    // track but broke on a 27s QuickTime trim — that's the tell.
+    '-bitexact',
+    '-map_metadata', '-1',
     '-f', 'wav', '-y',
     outputPath,
   ];
@@ -181,6 +189,9 @@ function runFfmpegFallback(inputPath: string, outputPath: string, reqId: string)
     '-ac', '1', '-ar', '44100', '-sample_fmt', 's16',
     '-acodec', 'pcm_s16le',
     '-af', 'aresample=async=1:first_pts=0',
+    // Same LIST-chunk strip as primary — required for fpcalc 1.5.1.
+    '-bitexact',
+    '-map_metadata', '-1',
     '-f', 'wav', '-y',
     outputPath,
   ];
