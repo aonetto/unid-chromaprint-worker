@@ -221,7 +221,14 @@ function runPipedFingerprint(
     // tells it the input is signed 16-bit little-endian PCM samples
     // at the declared sample rate + channel count. This bypasses
     // fpcalc's WAV/AAC/etc. demuxers entirely.
+    //
+    // `-raw` is critical: without it, `-json` emits a base64-encoded
+    // COMPRESSED fingerprint (variable-width diff encoding). Our
+    // identify comparison assumes raw 32-bit integer items, so we
+    // force fpcalc to emit the JSON integer array form, then pack it
+    // to LE uint32 bytes + 4-byte header + base64url ourselves below.
     const fpcalcArgs = [
+      '-raw',
       '-format', 's16le',
       '-rate', '44100',
       '-channels', '1',
@@ -284,12 +291,28 @@ function runPipedFingerprint(
       }
       try {
         const parsed = JSON.parse(fpcalcStdout);
-        if (!parsed.fingerprint || typeof parsed.duration !== 'number') {
-          settle(new Error(`fpcalc ${label} invalid JSON: ${fpcalcStdout.slice(0, 200)}`));
+        // With `-raw -json`, fpcalc emits `fingerprint` as a JSON array
+        // of signed 32-bit integers. Pack to LE uint32 bytes + a 4-byte
+        // header sentinel, then base64url-encode for the wire. The
+        // client decoder (lib/chromaprint.ts#decodeFingerprint) reads
+        // exactly this format.
+        if (!Array.isArray(parsed.fingerprint) || typeof parsed.duration !== 'number') {
+          settle(new Error(`fpcalc ${label} invalid JSON (expected int array): ${fpcalcStdout.slice(0, 200)}`));
           return;
         }
-        console.log(`[fp:${reqId}] ${label} success — duration=${parsed.duration}s, fp_length=${parsed.fingerprint.length}`);
-        settle(null, { fingerprint: parsed.fingerprint, duration: parsed.duration });
+        const items: number[] = parsed.fingerprint;
+        const buf = Buffer.alloc(4 + items.length * 4);
+        // 4-byte header: arbitrary sentinel (decoder skips the first 4 bytes).
+        buf.writeUInt32LE(1, 0);
+        for (let i = 0; i < items.length; i++) {
+          // fpcalc emits signed int32. writeInt32LE stores the bit-pattern;
+          // decoder reads via readUInt32LE so XOR-popcount works over the
+          // same bits either way.
+          buf.writeInt32LE(items[i] | 0, 4 + i * 4);
+        }
+        const fingerprint = buf.toString('base64url');
+        console.log(`[fp:${reqId}] ${label} success — duration=${parsed.duration}s, items=${items.length}, fp_b64_length=${fingerprint.length}`);
+        settle(null, { fingerprint, duration: parsed.duration });
       } catch (err) {
         settle(new Error(`fpcalc ${label} JSON parse: ${err instanceof Error ? err.message : 'unknown'}`));
       }
