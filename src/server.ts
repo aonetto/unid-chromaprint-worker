@@ -21,6 +21,18 @@ if (!WORKER_SECRET) {
   process.exit(1);
 }
 
+// Fingerprint format version. Stored per Fingerprint row in the main
+// DB and returned on every worker response so the identify path can
+// refuse to score mismatched versions (defensive against future
+// worker format changes producing silent noise-floor regressions —
+// exactly the bug we debugged in the `-raw` vs compressed incident).
+//
+// Bump this string when the on-wire fingerprint binary format changes
+// (NOT when fpcalc version or Chromaprint SHA changes without affecting
+// the output encoding). Every version bump requires a full reseed of
+// stored fingerprints before old rows become unmatchable.
+const FINGERPRINT_FORMAT_VERSION = 'chromaprint_v2';
+
 const app = Fastify({
   logger: true,
   bodyLimit: 200 * 1024 * 1024, // 200MB max audio (long-form DJ sets, full albums)
@@ -75,6 +87,7 @@ app.post('/fingerprint', async (req, reply) => {
       fingerprint: result.fingerprint,
       duration: result.duration,
       byteLength: buffer.length,
+      version: FINGERPRINT_FORMAT_VERSION,
     };
   } catch (err) {
     return handleFingerprintError(err, req, reply);
@@ -99,6 +112,7 @@ app.post('/fingerprint-chunked', async (req, reply) => {
       chunks: result.chunks,
       totalDuration: result.totalDuration,
       byteLength: buffer.length,
+      version: FINGERPRINT_FORMAT_VERSION,
     };
   } catch (err) {
     return handleFingerprintError(err, req, reply);

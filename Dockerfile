@@ -19,16 +19,30 @@ RUN apt-get update && \
       ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Build Chromaprint from master (ffmpeg 5.x API compatibility).
+# Build Chromaprint from a pinned master SHA (ffmpeg 5.x compatibility).
 # v1.5.1 tag predates the ffmpeg 5.x migration (removed
 # avcodec_decode_audio4, AVStream::codec, channel_layout, const
-# correctness on AVInputFormat, etc.) — only master compiles clean
-# against Debian bookworm's ffmpeg 5.1.x.
+# correctness on AVInputFormat, etc.) — only post-migration master
+# compiles clean against Debian bookworm's ffmpeg 5.1.x.
+#
+# Pinned to master SHA 6b13ce3a (captured 2026-04-23).
+# To bump: `git ls-remote https://github.com/acoustid/chromaprint.git HEAD`
+# Then verify locally:
+#   1. Rebuild this image.
+#   2. `npx tsx scripts/reseed-fingerprints.ts` (from main repo) against
+#      a staging worker URL.
+#   3. Re-run identify tests via /admin/identify-debug.
+#   4. Only then update the SHA and deploy.
+# Unpinned `git clone --depth 1` risks a silent noise-floor regression
+# on any future Railway redeploy if upstream changes item encoding.
+#
 # BUILD_TOOLS=ON compiles fpcalc linked against system FFmpeg libs.
 # BUILD_TESTS=OFF skips googletest fetch/compile (~30s saved).
 # FFT_LIB=avfft uses FFmpeg's FFT (avoids FFTW3 dep).
-RUN git clone --depth 1 https://github.com/acoustid/chromaprint.git /tmp/chromaprint && \
+ARG CHROMAPRINT_SHA=6b13ce3a81ae931e7477c4856a86bece99157cd8
+RUN git clone https://github.com/acoustid/chromaprint.git /tmp/chromaprint && \
     cd /tmp/chromaprint && \
+    git checkout ${CHROMAPRINT_SHA} && \
     cmake -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_TOOLS=ON \
           -DBUILD_TESTS=OFF \
